@@ -66,4 +66,4 @@ Parent-reported diagnoses reflect both true symptom presence and prior contact w
 
 ## Author
 
-Hannah Choi — portfolio analysis project.
+Hannah Choi 
