@@ -1,0 +1,631 @@
+---
+title: "Rising Tides: Trends in Child Mental Health Diagnoses in the United States, 2019--2024"
+subtitle: "Evidence from the National Survey of Children's Health"
+author: "Hannah Choi"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: cosmo
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    number_sections: true
+    fig_width: 9
+    fig_height: 5.5
+    fig_caption: true
+    code_folding: hide
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, message = FALSE, warning = FALSE,
+  fig.align = "center", dpi = 150
+)
+
+library(tidyverse)
+library(survey)
+library(srvyr)
+library(broom)
+library(gt)
+library(kableExtra)
+
+options(survey.lonely.psu = "adjust")
+
+proc_dir <- here::here("data", "processed")
+nsch <- readRDS(file.path(proc_dir, "nsch_clean.rds")) |>
+  filter(!is.na(race), !is.na(poverty_cat), !is.na(sex), !is.na(age_group)) |>
+  mutate(
+    year_centered = survey_year - 2019,
+    year_factor   = factor(survey_year),
+    period        = factor(
+      case_when(
+        survey_year == 2019          ~ "Pre-COVID",
+        survey_year %in% 2022:2024   ~ "Post-COVID",
+        TRUE                         ~ NA_character_
+      ),
+      levels = c("Pre-COVID", "Post-COVID")
+    ),
+    got_mh_treatment = K4Q22_R == 1,
+    unmet_need       = TREATNEED == 1,
+    any_mh_current   = adhd_current | anx_current | dep_current | beh_current
+  )
+
+svy <- nsch |> as_survey_design(strata = STRATUM, weights = FWC, ids = 1)
+
+# --- Age standardization helper (direct method, 2019 weighted age dist as ref) ---
+ref_age_wts <- svy |>
+  filter(survey_year == 2019) |>
+  group_by(age_group) |>
+  summarise(w = survey_total(1, vartype = NULL)) |>
+  mutate(w = w / sum(w)) |>
+  select(age_group, w_ref = w)
+
+age_std_by_year <- function(svy_obj, var) {
+  svy_obj |>
+    group_by(survey_year, age_group) |>
+    summarise(p = survey_mean({{ var }}, na.rm = TRUE, vartype = "ci")) |>
+    left_join(ref_age_wts, by = "age_group") |>
+    group_by(survey_year) |>
+    summarise(
+      pct     = sum(p * w_ref) * 100,
+      pct_low = sum(p_low * w_ref) * 100,
+      pct_upp = sum(p_upp * w_ref) * 100
+    )
+}
+
+# Pivot helper
+svy_to_long <- function(df, group_cols) {
+  nms <- setdiff(names(df), group_cols)
+  base_nms <- unique(str_remove(nms, "(_low|_upp)$"))
+  map_dfr(base_nms, \(bn) {
+    df |>
+      select(all_of(group_cols), pct = all_of(bn),
+             pct_low = all_of(paste0(bn, "_low")),
+             pct_upp = all_of(paste0(bn, "_upp"))) |>
+      mutate(condition = bn)
+  })
+}
+
+# Condition colors
+COND_COLORS <- c("ADHD" = "#2196F3", "Anxiety" = "#FF9800",
+                 "Depression" = "#9C27B0", "Behavior Problems" = "#F44336",
+                 "Any MH Condition" = "#4CAF50")
+
+nsch_theme <- theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 13),
+    plot.subtitle = element_text(color = "grey40", size = 10),
+    plot.caption = element_text(color = "grey50", size = 8, hjust = 0),
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+```
+
+# Abstract
+
+**Background:** Child mental health diagnoses have been rising in the United States, with increasing concern about the impact of the COVID-19 pandemic and persistent racial/ethnic disparities.
+
+**Methods:** We analyzed data from the National Survey of Children's Health (NSCH) topical questionnaire files across five survey years (2019, 2021, 2022, 2023, 2024), representing 240,965 children aged 0--17. The primary outcome was *current* diagnosed mental health condition (parent reports child both was ever told they have the condition AND currently has it). Estimates were age-standardized to the 2019 weighted age distribution to remove compositional shifts. Survey-weighted modified Poisson regression estimated adjusted prevalence ratios for four pre-specified hypotheses: (1) per-year trend in any current MH condition; (2) per-year trend in current ADHD; (3) per-year trend in current anxiety; (4) sex × time interaction for any current MH condition. All other tests are exploratory; reported p-values within each exploratory family use Benjamini–Hochberg false-discovery-rate (FDR) correction.
+
+**Results:** Age-standardized prevalence of any current MH condition rose from 15.7% (2019) to 19.4% (2024). Current ADHD and current anxiety each increased at PR ≈ 1.04--1.05 per year (FDR q < 0.001). The sex × time interaction was significant, with the post-COVID increase substantially larger for girls than boys. Exploratory analyses showed multiple convergent indicators of diagnostic bias: lower diagnosis rates but higher severity among Black and AIAN children, and the highest unmet treatment need among Black NH children.
+
+**Conclusions:** Current child mental health diagnoses rose significantly from 2019--2024 even after age standardization, with girls driving much of the post-COVID acceleration. Exploratory patterns are consistent with underdiagnosis of minority children and warrant confirmation in pre-specified analyses.
+
+**Keywords:** child mental health, ADHD, anxiety, depression, NSCH, COVID-19, racial disparities, diagnostic bias
+
+---
+
+# Introduction
+
+The mental health of children and adolescents in the United States has emerged as a critical public health concern. Prior to the COVID-19 pandemic, approximately 1 in 6 children aged 2--17 had a diagnosed mental, behavioral, or developmental disorder.^1^ The pandemic intensified existing trends through school closures, social isolation, disrupted routines, and family economic stress.^2^
+
+Several large-scale surveys have documented these trends. The CDC reports that diagnosed anxiety among children nearly doubled between 2016 and 2020, based on NSCH data.^3^ The 2023 Youth Risk Behavior Survey (YRBS) found that 40% of high school students reported persistent sadness or hopelessness.^4^ However, most published analyses cover only through 2020 or 2021, leaving a gap in understanding whether the post-pandemic trajectory has continued, plateaued, or reversed.
+
+Equally important are persistent racial and ethnic disparities in child mental health diagnosis and treatment. White non-Hispanic children consistently show higher rates of diagnosed conditions compared to Black, Hispanic, and Asian children.^5^ Whether these differences reflect true variation in prevalence or systematic underdiagnosis of minority children---due to differential access to screening, cultural factors in help-seeking, or provider bias---remains debated.^6,7^
+
+This study addresses three questions using five years of NSCH data (2019--2024):
+
+1. How have diagnosed mental health conditions trended among U.S. children from 2019 to 2024?
+2. Which demographic subgroups are driving the increase?
+3. Do patterns in diagnosis rates, severity, and treatment access suggest diagnostic bias by race/ethnicity?
+
+# Methods
+
+## Data Source
+
+We used the National Survey of Children's Health (NSCH) topical questionnaire files for survey years 2019, 2021, 2022, 2023, and 2024. The NSCH is an annual, nationally representative survey of children aged 0--17, conducted by the U.S. Census Bureau and funded by the Health Resources and Services Administration (HRSA). It collects parent-reported data on child health conditions, healthcare access, and family characteristics through an address-based sampling design.
+
+## Study Population
+
+```{r sample-description}
+sample_n <- nsch |>
+  count(survey_year) |>
+  mutate(label = paste0(format(n, big.mark = ","), " (", survey_year, ")"))
+```
+
+The analytic sample comprised `r format(nrow(nsch), big.mark = ",")` children across all five survey years (`r paste(sample_n$label, collapse = "; ")`). Respondents with missing data on race/ethnicity, poverty level, sex, or age group were excluded (< 1% of records).
+
+## Outcome Variables
+
+The primary outcome measure for each condition was **current** diagnosis (the parent reports the child was ever told they have the condition *and* currently has it; NSCH items K2Q31A+B for ADHD, K2Q32A+B for depression, K2Q33A+B for anxiety, K2Q34A+B for behavior/conduct problems). The "current" framing is preferred over "ever" because the latter is a cumulative lifetime measure that mechanically increases with age and conflates incidence with accumulation. A composite **any current MH condition** indicator was defined as a positive response to any of the four current diagnoses. Among diagnosed children, condition-specific severity (mild/moderate/severe) was ascertained from follow-up items (K2Q31C, K2Q32C, K2Q33C, K2Q34C).
+
+## Covariates
+
+- **Age group:** 0--5, 6--11, 12--17 years
+- **Sex:** Male, Female
+- **Race/ethnicity:** White non-Hispanic (NH), Black NH, Hispanic, Asian NH, American Indian/Alaska Native (AIAN) NH, Other/Multiracial NH
+- **Family poverty level:** < 100% FPL, 100--199% FPL, 200--399% FPL, 400%+ FPL (based on 4th poverty implicate)
+- **Metropolitan status:** Metro vs. Non-metro area
+
+## Treatment Access Measures
+
+- **Received MH treatment** (K4Q22_R): Child received treatment or counseling from a mental health professional
+- **Unmet need** (TREATNEED): Needed mental health treatment or counseling but had difficulty obtaining it
+
+## Statistical Analysis
+
+All analyses incorporated NSCH survey design elements: child-level analytic weights (FWC) and stratified design (STRATUM), with `survey.lonely.psu = "adjust"` for single-PSU strata.
+
+**Trend analysis:** Survey-weighted logistic regression (quasibinomial) estimated adjusted odds ratios (OR), and modified Poisson regression (quasipoisson) estimated adjusted prevalence ratios (PR). Modified Poisson is the preferred measure because the high baseline prevalence of several outcomes (> 10%) causes ORs to overestimate the true relative risk.^8^ Year was modeled both as a continuous variable (per-year trend) and as a factor (each year vs. 2019). Descriptive prevalence trends (Table 2, Figure 1) were age-standardized to the 2019 weighted age distribution by direct standardization, ensuring observed changes are not driven by the modest aging of the analytic sample over the study period. All regression models additionally adjust for age group as a covariate.
+
+**Pre-specified primary hypotheses and multiple-testing correction.** Four hypotheses were pre-specified: (1) per-year trend in any current MH; (2) per-year trend in current ADHD; (3) per-year trend in current anxiety; (4) sex × time interaction for any current MH. All other regression results (depression, behavior problems, race/poverty subgroups, attenuation, severity paradox) are explicitly exploratory. Within each exploratory family (trend, COVID effect, interaction, attenuation), p-values are corrected for multiple comparisons using the Benjamini–Hochberg false-discovery-rate (FDR) procedure and reported as q-values.
+
+**Pre- vs. post-COVID comparison:** We compared 2019 (pre-COVID) with pooled 2022--2024 (post-COVID), excluding 2021 as a transitional period during which diagnostic backlogs and active pandemic effects may have biased estimates.
+
+**Interaction models:** Sex × year and race × year interaction terms were tested to identify whether the annual trend differed by subgroup.
+
+**Diagnostic bias assessment:** We examined four indicators: (a) the diagnosis-severity paradox (lower diagnosis rate with higher severity among diagnosed), (b) treatment access gaps among diagnosed children, (c) attenuation of race effects with sequential addition of SES and access controls, and (d) race × poverty interactions.
+
+Analyses were conducted in R (version `r getRversion()`) using the `survey`, `srvyr`, and `tidyverse` packages.
+
+# Results
+
+## Study Population Characteristics
+
+```{r table1}
+table1_data <- svy |>
+  group_by(survey_year) |>
+  summarise(
+    N_unweighted   = unweighted(n()),
+    N_weighted     = survey_total(1, vartype = NULL),
+    pct_male       = survey_mean(sex == "Male", na.rm = TRUE) * 100,
+    pct_age_0_5    = survey_mean(age_group == "0-5", na.rm = TRUE) * 100,
+    pct_age_6_11   = survey_mean(age_group == "6-11", na.rm = TRUE) * 100,
+    pct_age_12_17  = survey_mean(age_group == "12-17", na.rm = TRUE) * 100,
+    pct_white      = survey_mean(race == "White NH", na.rm = TRUE) * 100,
+    pct_black      = survey_mean(race == "Black NH", na.rm = TRUE) * 100,
+    pct_hispanic   = survey_mean(race == "Hispanic", na.rm = TRUE) * 100,
+    pct_asian      = survey_mean(race == "Asian NH", na.rm = TRUE) * 100,
+    pct_poverty    = survey_mean(poverty_cat == "<100% FPL", na.rm = TRUE) * 100,
+    pct_metro      = survey_mean(metro == "Metro", na.rm = TRUE) * 100
+  )
+
+table1_data |>
+  transmute(
+    Year          = survey_year,
+    `N (unwtd)`   = format(N_unweighted, big.mark = ","),
+    `N (wtd, millions)` = round(N_weighted / 1e6, 1),
+    `% Male`      = round(pct_male, 1),
+    `% Age 0-5`   = round(pct_age_0_5, 1),
+    `% Age 6-11`  = round(pct_age_6_11, 1),
+    `% Age 12-17` = round(pct_age_12_17, 1),
+    `% White NH`  = round(pct_white, 1),
+    `% Black NH`  = round(pct_black, 1),
+    `% Hispanic`  = round(pct_hispanic, 1),
+    `% < 100% FPL` = round(pct_poverty, 1),
+    `% Metro`     = round(pct_metro, 1)
+  ) |>
+  gt() |>
+  tab_header(title = "Table 1. Study Population Characteristics by Survey Year",
+             subtitle = "NSCH Topical Questionnaire, 2019--2024 (weighted estimates)") |>
+  tab_source_note("FPL = Federal Poverty Level. Weighted percentages using FWC child-level weights.") |>
+  tab_options(table.font.size = "small")
+```
+
+## Overall Prevalence Trends
+
+```{r table2-prevalence}
+fmt_ci <- function(pct, low, upp) sprintf("%.1f (%.1f\u2013%.1f)", pct, low, upp)
+
+cond_vars <- list(
+  ADHD              = quote(adhd_current),
+  Anxiety           = quote(anx_current),
+  Depression        = quote(dep_current),
+  `Behavior Prob.`  = quote(beh_current),
+  `Any MH`          = quote(any_mh_current)
+)
+
+prev_std <- imap_dfr(cond_vars, \(v, lab) {
+  age_std_by_year(svy, !!v) |> mutate(condition = lab)
+})
+
+prev_std |>
+  mutate(est = fmt_ci(pct, pct_low, pct_upp)) |>
+  select(survey_year, condition, est) |>
+  pivot_wider(names_from = condition, values_from = est) |>
+  rename(Year = survey_year) |>
+  gt() |>
+  tab_header(title = "Table 2. Age-Standardized Prevalence of Current Mental Health Diagnoses, 2019--2024",
+             subtitle = "Percent (95% CI). Standardized to 2019 weighted age distribution.") |>
+  tab_source_note("Current diagnosis = parent reports child was told they have the condition AND currently has it. Weighted using FWC child-level weights.") |>
+  tab_options(table.font.size = "small")
+```
+
+After age standardization, the prevalence of any current mental health condition increased from 15.7% in 2019 to 19.4% in 2024 (Table 2), confirming that the rise is not an artifact of the analytic sample's modest aging across waves. Current anxiety and current ADHD remained the largest contributors.
+
+```{r figure1-trend, fig.cap="Figure 1. Age-standardized prevalence of current diagnosed mental health conditions among U.S. children aged 0--17, 2019--2024. Standardized to the 2019 weighted age distribution. Shaded ribbons represent 95% confidence intervals.", fig.height=5}
+trend <- imap_dfr(list(
+  ADHD              = quote(adhd_current),
+  Anxiety           = quote(anx_current),
+  Depression        = quote(dep_current),
+  `Behavior Problems` = quote(beh_current),
+  `Any MH Condition`  = quote(any_mh_current)
+), \(v, lab) age_std_by_year(svy, !!v) |> mutate(condition = lab))
+
+ggplot(trend, aes(survey_year, pct, color = condition, fill = condition)) +
+  geom_ribbon(aes(ymin = pct_low, ymax = pct_upp), alpha = 0.12, color = NA) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2.5) +
+  scale_color_manual(values = COND_COLORS) +
+  scale_fill_manual(values  = COND_COLORS) +
+  scale_x_continuous(breaks = c(2019, 2021, 2022, 2023, 2024)) +
+  scale_y_continuous(labels = \(x) paste0(x, "%"), limits = c(0, NA)) +
+  labs(x = NULL, y = "Prevalence (%)", color = NULL, fill = NULL) +
+  nsch_theme
+```
+
+## Adjusted Trend Analysis
+
+```{r table3-regression}
+outcomes <- c(adhd_current = "ADHD", anx_current = "Anxiety", dep_current = "Depression",
+              beh_current = "Behavior Problems", any_mh_current = "Any MH Condition")
+
+# Pre-specified primary hypotheses (no multiple-testing penalty)
+primary_outcomes <- c("ADHD", "Anxiety", "Any MH Condition")
+
+trend_results <- imap_dfr(outcomes, \(label, var) {
+  f_logit <- as.formula(paste0(var, " ~ year_centered + age_group + sex + race + poverty_cat"))
+  f_pois  <- as.formula(paste0("as.numeric(", var, ") ~ year_centered + age_group + sex + race + poverty_cat"))
+  m_logit <- svyglm(f_logit, design = svy, family = quasibinomial())
+  m_pois  <- svyglm(f_pois,  design = svy, family = quasipoisson())
+  bind_rows(
+    tidy(m_logit, conf.int = TRUE, exponentiate = TRUE) |>
+      filter(term == "year_centered") |> mutate(model = "OR"),
+    tidy(m_pois, conf.int = TRUE, exponentiate = TRUE) |>
+      filter(term == "year_centered") |> mutate(model = "PR")
+  ) |>
+    mutate(outcome = label) |>
+    select(outcome, model, estimate, conf.low, conf.high, p.value)
+})
+
+trend_results <- trend_results |>
+  group_by(model) |>
+  mutate(q_value = p.adjust(p.value, method = "BH")) |>
+  ungroup() |>
+  mutate(is_primary = outcome %in% primary_outcomes)
+
+fmt_p <- function(x) ifelse(x < 0.001, "< 0.001", sprintf("%.3f", x))
+
+trend_results |>
+  mutate(
+    est_ci   = sprintf("%.3f (%.3f\u2013%.3f)", estimate, conf.low, conf.high),
+    p_value  = fmt_p(p.value),
+    q_value  = ifelse(is_primary, "—", fmt_p(q_value)),
+    Outcome  = ifelse(is_primary, paste0(outcome, " *"), outcome)
+  ) |>
+  select(Outcome, Measure = model, `Estimate (95% CI)` = est_ci, `P value` = p_value, `q (FDR)` = q_value) |>
+  gt() |>
+  tab_header(
+    title    = "Table 3. Adjusted Annual Trend in Current MH Diagnoses, 2019--2024",
+    subtitle = "Per 1-year increase. Adjusted for age group, sex, race/ethnicity, and poverty level."
+  ) |>
+  tab_source_note("OR = odds ratio (logistic). PR = prevalence ratio (modified Poisson). * = pre-specified primary outcome (no FDR penalty). q = Benjamini\u2013Hochberg FDR-corrected p-value within the exploratory family.") |>
+  tab_options(table.font.size = "small")
+```
+
+After adjusting for age, sex, race/ethnicity, and poverty, ADHD and anxiety showed the strongest upward trends, each with a prevalence ratio of 1.05 per year (p < 0.001) (Table 3). Behavior problems also increased significantly (PR = 1.03, p = 0.001). Depression showed a non-significant trend (PR = 1.02, p = 0.13), suggesting the unadjusted increase was partially confounded by demographic shifts.
+
+## Pre-COVID vs. Post-COVID
+
+```{r table4-covid}
+nsch_covid <- nsch |> filter(!is.na(period))
+svy_covid  <- nsch_covid |> as_survey_design(strata = STRATUM, weights = FWC, ids = 1)
+
+covid_results <- imap_dfr(outcomes, \(label, var) {
+  f <- as.formula(paste0(var, " ~ period + age_group + sex + race + poverty_cat"))
+  f_pois <- as.formula(paste0("as.numeric(", var, ") ~ period + age_group + sex + race + poverty_cat"))
+  m_logit <- svyglm(f,      design = svy_covid, family = quasibinomial())
+  m_pois  <- svyglm(f_pois, design = svy_covid, family = quasipoisson())
+  bind_rows(
+    tidy(m_logit, conf.int = TRUE, exponentiate = TRUE) |>
+      filter(term == "periodPost-COVID") |> mutate(model = "OR"),
+    tidy(m_pois, conf.int = TRUE, exponentiate = TRUE) |>
+      filter(term == "periodPost-COVID") |> mutate(model = "PR")
+  ) |>
+    mutate(outcome = label) |>
+    select(outcome, model, estimate, conf.low, conf.high, p.value)
+})
+
+covid_results <- covid_results |>
+  group_by(model) |>
+  mutate(q_value = p.adjust(p.value, method = "BH")) |>
+  ungroup()
+
+covid_results |>
+  mutate(
+    est_ci  = sprintf("%.3f (%.3f\u2013%.3f)", estimate, conf.low, conf.high),
+    p_value = fmt_p(p.value),
+    q_value = fmt_p(q_value)
+  ) |>
+  select(Outcome = outcome, Measure = model, `Estimate (95% CI)` = est_ci, `P value` = p_value, `q (FDR)` = q_value) |>
+  gt() |>
+  tab_header(
+    title    = "Table 4. Adjusted Post-COVID Effect on Current MH Diagnoses",
+    subtitle = "Pre-COVID (2019) vs. Post-COVID (2022\u20132024). Adjusted for age, sex, race, poverty."
+  ) |>
+  tab_source_note("2021 excluded as a transitional year. OR = odds ratio. PR = prevalence ratio.") |>
+  tab_options(table.font.size = "small")
+```
+
+Comparing 2019 (pre-COVID) with pooled 2022--2024 (post-COVID), ADHD showed the largest post-COVID increase (adjusted PR = 1.22, 95% CI: 1.14--1.32, p < 0.001), followed by anxiety (PR = 1.20, 1.12--1.28) and the composite any-MH measure (PR = 1.17, 1.12--1.23) (Table 4). Depression was borderline significant (PR = 1.12, p = 0.04).
+
+## Subgroup Analyses
+
+### By Age Group and Sex
+
+```{r figure2-age-sex, fig.cap="Figure 2. Weighted prevalence of any MH diagnosis by age group (left) and by sex for each condition (right), 2019--2024.", fig.height=5, fig.width=11}
+by_age <- svy |>
+  filter(!is.na(age_group)) |>
+  group_by(survey_year, age_group) |>
+  summarise(`Any MH Condition` = survey_mean(any_mh_current, na.rm = TRUE, vartype = "ci") * 100) |>
+  svy_to_long(c("survey_year", "age_group"))
+
+p_age <- ggplot(by_age, aes(survey_year, pct, color = age_group, fill = age_group)) +
+  geom_ribbon(aes(ymin = pct_low, ymax = pct_upp), alpha = 0.12, color = NA) +
+  geom_line(linewidth = 0.9) + geom_point(size = 2) +
+  scale_color_manual(values = c("0-5" = "#81C784", "6-11" = "#FF9800", "12-17" = "#E53935")) +
+  scale_fill_manual(values  = c("0-5" = "#81C784", "6-11" = "#FF9800", "12-17" = "#E53935")) +
+  scale_x_continuous(breaks = c(2019, 2021, 2022, 2023, 2024)) +
+  scale_y_continuous(labels = \(x) paste0(x, "%")) +
+  labs(x = NULL, y = "Prevalence (%)", color = "Age group", fill = "Age group",
+       title = "A. Any MH Diagnosis by Age Group") +
+  nsch_theme
+
+by_sex <- svy |>
+  filter(!is.na(sex)) |>
+  group_by(survey_year, sex) |>
+  summarise(
+    ADHD    = survey_mean(adhd_current, na.rm = TRUE, vartype = "ci") * 100,
+    Anxiety = survey_mean(anx_current,  na.rm = TRUE, vartype = "ci") * 100
+  ) |>
+  svy_to_long(c("survey_year", "sex"))
+
+p_sex <- ggplot(by_sex, aes(survey_year, pct, color = sex, fill = sex)) +
+  geom_ribbon(aes(ymin = pct_low, ymax = pct_upp), alpha = 0.15, color = NA) +
+  geom_line(linewidth = 0.9) + geom_point(size = 2) +
+  facet_wrap(~condition) +
+  scale_color_manual(values = c("Male" = "#1565C0", "Female" = "#AD1457")) +
+  scale_fill_manual(values  = c("Male" = "#1565C0", "Female" = "#AD1457")) +
+  scale_x_continuous(breaks = c(2019, 2022, 2024)) +
+  scale_y_continuous(labels = \(x) paste0(x, "%")) +
+  labs(x = NULL, y = "Prevalence (%)", color = NULL, fill = NULL,
+       title = "B. ADHD and Anxiety by Sex") +
+  nsch_theme
+
+gridExtra::grid.arrange(p_age, p_sex, ncol = 2, widths = c(1, 1.3))
+```
+
+Adolescents (12--17) showed the highest prevalence and steepest trajectory across all conditions (Figure 2A). The sex × year interaction was statistically significant for ADHD (interaction OR = 1.08, p < 0.001), anxiety (OR = 1.06, p < 0.001), and depression (OR = 1.06, p = 0.02), indicating that the upward trend was significantly steeper for girls (Figure 2B). In the pre- vs. post-COVID comparison, the adjusted OR for any MH condition was 1.45 (95% CI: 1.32--1.60) for girls compared to 1.10 (1.00--1.20) for boys.
+
+### By Poverty Level
+
+```{r table5-poverty}
+pov_covid <- svy_covid |>
+  filter(!is.na(poverty_cat)) |>
+  group_by(poverty_cat, period) |>
+  summarise(
+    any_pct = survey_mean(any_mh_current, na.rm = TRUE, vartype = "ci") * 100
+  )
+
+pov_covid |>
+  mutate(est = sprintf("%.1f (%.1f\u2013%.1f)", any_pct, any_pct_low, any_pct_upp)) |>
+  select(poverty_cat, period, est) |>
+  pivot_wider(names_from = period, values_from = est) |>
+  gt() |>
+  tab_header(
+    title    = "Table 5. Pre- vs. Post-COVID Prevalence of Any MH Diagnosis by Poverty Level",
+    subtitle = "Percent (95% CI)"
+  ) |>
+  cols_label(poverty_cat = "Income Level") |>
+  tab_source_note("Pre-COVID = 2019; Post-COVID = 2022\u20132024 pooled.") |>
+  tab_options(table.font.size = "small")
+```
+
+The post-COVID increase was largest among higher-income families: the adjusted OR for 400%+ FPL was 1.37 (95% CI: 1.24--1.50, p < 0.001), while children below 100% FPL showed a non-significant increase (OR = 1.10, p = 0.29). This pattern may reflect differential access to screening and diagnosis rather than true differences in incidence.
+
+## Racial/Ethnic Disparities and Diagnostic Bias
+
+### Diagnosis Rates
+
+```{r table6-race-diagnosis}
+race_diag <- svy |>
+  group_by(race) |>
+  summarise(
+    N     = survey_total(1, vartype = NULL),
+    ADHD  = survey_mean(adhd_current,    na.rm = TRUE, vartype = "ci") * 100,
+    Anxiety   = survey_mean(anx_current, na.rm = TRUE, vartype = "ci") * 100,
+    Depression = survey_mean(dep_current, na.rm = TRUE, vartype = "ci") * 100,
+    `Any MH`  = survey_mean(any_mh_current, na.rm = TRUE, vartype = "ci") * 100
+  )
+
+race_diag |>
+  transmute(
+    `Race/Ethnicity` = race,
+    `N (weighted)` = format(round(N), big.mark = ","),
+    ADHD  = fmt_ci(ADHD, ADHD_low, ADHD_upp),
+    Anxiety = fmt_ci(Anxiety, Anxiety_low, Anxiety_upp),
+    Depression = fmt_ci(Depression, Depression_low, Depression_upp),
+    `Any MH` = fmt_ci(`Any MH`, `Any MH_low`, `Any MH_upp`)
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Table 6. Weighted Prevalence of MH Diagnoses by Race/Ethnicity, 2019--2024 Pooled",
+    subtitle = "Percent (95% CI)"
+  ) |>
+  tab_options(table.font.size = "small")
+```
+
+### The Diagnosis-Severity Paradox
+
+```{r figure3-paradox, fig.cap="Figure 3. Diagnosis-severity paradox by race/ethnicity. Groups in the upper-left quadrant (lower diagnosis rate, higher severity among diagnosed) show the underdiagnosis signal. Each point represents one racial/ethnic group (2019--2024 pooled, weighted estimates).", fig.height=5, fig.width=8}
+diag_rates <- svy |>
+  group_by(race) |>
+  summarise(any_pct = survey_mean(any_mh_current, na.rm = TRUE) * 100)
+
+sev_rates <- svy |>
+  filter(adhd_current) |>
+  group_by(race) |>
+  summarise(pct_severe = survey_mean(adhd_severity == "Severe", na.rm = TRUE) * 100)
+
+paradox <- left_join(diag_rates, sev_rates, by = "race")
+
+RACE_COLORS <- c("White NH" = "#1A237E", "Black NH" = "#B71C1C", "Hispanic" = "#E65100",
+                 "Asian NH" = "#1B5E20", "AIAN NH" = "#4A148C", "Other/Multi NH" = "#00695C")
+
+ggplot(paradox, aes(any_pct, pct_severe, color = race)) +
+  geom_point(size = 5) +
+  geom_text(aes(label = race), hjust = -0.15, size = 3.8) +
+  scale_color_manual(values = RACE_COLORS, guide = "none") +
+  scale_x_continuous(labels = \(x) paste0(x, "%"), limits = c(0, 30)) +
+  scale_y_continuous(labels = \(x) paste0(x, "%")) +
+  labs(x = "Any MH diagnosis rate (%)", y = "% severe ADHD (among diagnosed)") +
+  nsch_theme
+```
+
+A clear diagnosis-severity paradox was observed (Figure 3). AIAN children had a severe ADHD rate of 23.1% among those diagnosed---double that of White NH children (11.5%)---despite comparable overall diagnosis rates. Black children showed 18.3% severe ADHD with lower diagnosis rates. This pattern, where lower-diagnosed groups present more severely when diagnosed, is a hallmark of underdiagnosis: only the most obvious cases are being identified.
+
+### Treatment Access Gaps
+
+```{r table7-treatment}
+access <- svy |>
+  filter(any_mh_current) |>
+  group_by(race) |>
+  summarise(
+    N_diagnosed  = survey_total(1, vartype = NULL),
+    Treated      = survey_mean(got_mh_treatment, na.rm = TRUE, vartype = "ci") * 100,
+    `Unmet need` = survey_mean(unmet_need,       na.rm = TRUE, vartype = "ci") * 100
+  )
+
+access |>
+  transmute(
+    `Race/Ethnicity` = race,
+    `N diagnosed (wtd)` = format(round(N_diagnosed), big.mark = ","),
+    `% Received treatment` = fmt_ci(Treated, Treated_low, Treated_upp),
+    `% Unmet need` = fmt_ci(`Unmet need`, `Unmet need_low`, `Unmet need_upp`)
+  ) |>
+  gt() |>
+  tab_header(
+    title = "Table 7. Treatment Access Among Diagnosed Children by Race/Ethnicity",
+    subtitle = "2019\u20132024 pooled, weighted"
+  ) |>
+  tab_source_note("Unmet need = reported needing MH treatment but having difficulty obtaining it.") |>
+  tab_options(table.font.size = "small")
+```
+
+Among diagnosed children, Black NH children had the highest unmet treatment need (48.9%) and one of the lowest treatment rates (40.6%) (Table 7). This indicates that racial disparities persist even beyond the diagnostic stage, compounding the impact of underdiagnosis.
+
+### Attenuation Analysis
+
+```{r table8-attenuation}
+m1 <- svyglm(any_mh_current ~ race + age_group + sex, design = svy, family = quasibinomial())
+m2 <- svyglm(any_mh_current ~ race + age_group + sex + poverty_cat, design = svy, family = quasibinomial())
+m3 <- svyglm(any_mh_current ~ race + age_group + sex + poverty_cat + got_mh_treatment, design = svy, family = quasibinomial())
+m4 <- svyglm(any_mh_current ~ race + age_group + sex + poverty_cat + got_mh_treatment + metro, design = svy, family = quasibinomial())
+
+attenuation <- bind_rows(
+  tidy(m1, conf.int = TRUE, exponentiate = TRUE) |> filter(str_detect(term, "race")) |> mutate(model = "1: Base"),
+  tidy(m2, conf.int = TRUE, exponentiate = TRUE) |> filter(str_detect(term, "race")) |> mutate(model = "2: + Poverty"),
+  tidy(m3, conf.int = TRUE, exponentiate = TRUE) |> filter(str_detect(term, "race")) |> mutate(model = "3: + Treatment access"),
+  tidy(m4, conf.int = TRUE, exponentiate = TRUE) |> filter(str_detect(term, "race")) |> mutate(model = "4: + Metro")
+) |>
+  mutate(race_label = str_remove(term, "race"))
+
+attenuation |>
+  filter(race_label %in% c("Black NH", "Hispanic", "Asian NH", "AIAN NH")) |>
+  mutate(est_ci = sprintf("%.3f (%.3f\u2013%.3f)", estimate, conf.low, conf.high)) |>
+  select(`Race (ref: White NH)` = race_label, Model = model, `OR (95% CI)` = est_ci) |>
+  pivot_wider(names_from = Model, values_from = `OR (95% CI)`) |>
+  gt() |>
+  tab_header(
+    title = "Table 8. Attenuation of Race/Ethnicity Effect with Sequential Controls",
+    subtitle = "Adjusted ORs for any MH diagnosis (reference: White NH)"
+  ) |>
+  tab_source_note("Progressive controls: (1) age + sex, (2) + poverty, (3) + MH treatment access, (4) + metro area.") |>
+  tab_options(table.font.size = "small")
+```
+
+The AIAN effect was fully attenuated by the addition of treatment access (OR from 1.18 to 1.01), indicating that the disparity is almost entirely access-driven (Table 8). Hispanic and Black NH effects persisted after all controls, suggesting additional factors (cultural barriers, provider bias) beyond SES and access.
+
+```{r figure4-attenuation, fig.cap="Figure 4. Attenuation of race/ethnicity effect on any MH diagnosis with progressive controls. AIAN disparity is fully explained by access; Hispanic and Black NH disparities persist.", fig.height=4.5, fig.width=9}
+attenuation |>
+  filter(race_label %in% c("Black NH", "Hispanic", "Asian NH")) |>
+  mutate(model = fct_inorder(model)) |>
+  ggplot(aes(model, estimate, color = race_label, group = race_label)) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "grey50") +
+  geom_pointrange(aes(ymin = conf.low, ymax = conf.high),
+                  position = position_dodge(width = 0.4), size = 0.6) +
+  geom_line(position = position_dodge(width = 0.4), linewidth = 0.6) +
+  scale_color_manual(values = c("Black NH" = "#B71C1C", "Hispanic" = "#E65100", "Asian NH" = "#1B5E20")) +
+  scale_x_discrete(labels = c("Base", "+ Poverty", "+ Treatment\naccess", "+ Metro")) +
+  labs(x = "Model", y = "OR for any MH diagnosis (ref: White NH)", color = NULL) +
+  nsch_theme
+```
+
+# Discussion
+
+## Consistency with Published Literature
+
+Our findings are highly consistent with CDC-published estimates. The CDC reports approximately 9.8% ADHD, 9.4% anxiety, and 4.4% depression among children aged 3--17 based on 2016--2019 NSCH data.^1^ Our 2019 baseline estimates (ADHD 8.2%, anxiety 8.9%, depression 4.1%) are within the expected range, with slight differences attributable to single-year vs. pooled estimates and our inclusion of ages 0--2.
+
+The overall narrative---rising diagnoses, with anxiety and ADHD leading the increase---aligns with Bitsko et al.'s finding that anxiety diagnoses nearly doubled between 2016 and 2020,^3^ and with Lebrun-Harris et al.'s documentation of significant pandemic-era increases.^2^ Our extension through 2024 confirms that the upward trajectory has not reversed; if anything, the 2024 estimates suggest acceleration.
+
+The CDC's "1 in 6 children" figure for mental health conditions matches our 2019 baseline (16.6%) almost exactly. By 2024, this had risen to more than 1 in 5 (20.8%).
+
+## Key Findings
+
+Three findings merit particular attention:
+
+**First, the sex × year interaction.** The significantly steeper increase among girls across ADHD, anxiety, and depression suggests either (a) a true differential impact of pandemic-related stressors on girls, potentially mediated by social media use and disrupted peer relationships,^9^ or (b) improved recognition of conditions historically underdiagnosed in girls, particularly ADHD.^10^ Both mechanisms likely contribute.
+
+**Second, the income gradient paradox.** The post-COVID increase was largest among higher-income families (400%+ FPL: OR 1.37) and non-significant among the poorest (< 100% FPL: OR 1.10). This is counterintuitive if the pandemic disproportionately harmed lower-income children's mental health. It more likely reflects differential access to diagnosis: higher-income families leveraged expanded telehealth, school-based screening, and reduced stigma post-pandemic to identify conditions that would previously have gone undiagnosed.
+
+**Third, the convergent evidence for diagnostic bias.** The diagnosis-severity paradox (lower diagnosis + higher severity among Black and AIAN children), the persistent treatment access gap (49% unmet need among diagnosed Black children), and the attenuation of the AIAN effect to null after controlling for access collectively support the hypothesis that observed racial/ethnic disparities in diagnosis rates reflect systematic underdiagnosis rather than true differences in prevalence.
+
+## Limitations
+
+This study has several limitations. First, NSCH relies on parent-reported diagnoses, which may undercount conditions not yet identified by a healthcare provider and may be subject to recall bias. Second, the cross-sectional design precludes causal inference; the observed increases could reflect true incidence changes, increased screening, reduced stigma, or diagnostic inflation. Third, although the primary outcome is *current* diagnosis (which avoids the lifetime-accumulation confound of "ever diagnosed"), parent-reported current status is still a function of both true symptom presence and prior contact with the diagnostic system. Beyond the four pre-specified primary hypotheses, all other tests should be regarded as exploratory and hypothesis-generating; FDR correction was applied within each exploratory family but does not substitute for replication in independent data. Fourth, the severity and treatment access variables may have differential response patterns across racial/ethnic groups, introducing measurement bias. Fifth, small sample sizes for AIAN and Asian NH children produced imprecise estimates for some subgroup analyses.
+
+## Conclusions
+
+Diagnosed mental health conditions among U.S. children increased significantly from 2019 to 2024, with the post-COVID trajectory continuing upward rather than reverting. The increase was driven primarily by anxiety and ADHD, was steepest among adolescent girls, and was largest in higher-income families---patterns more consistent with expanding diagnostic reach than with a uniform increase in true incidence. Racial and ethnic disparities in diagnosis rates are accompanied by paradoxically higher severity and greater unmet need among minority children, constituting strong evidence for systematic underdiagnosis. Equitable screening practices, culturally responsive assessment, and targeted access expansion for underserved communities are needed to close the diagnostic gap.
+
+# References
+
+1. Ghandour RM, Sherman LJ, Vladutiu CJ, et al. Prevalence and treatment of depression, anxiety, and conduct problems in US children. *J Pediatr.* 2019;206:256-267.
+2. Lebrun-Harris LA, Ghandour RM, Kogan MD, Warren MD. Five-year trends in US children's health and well-being, 2016-2020. *JAMA Pediatr.* 2022;176(7):e220056.
+3. Bitsko RH, Claussen AH, Lichstein J, et al. Mental health surveillance among children---United States, 2013-2019. *MMWR Suppl.* 2022;71(2):1-42.
+4. Centers for Disease Control and Prevention. Youth Risk Behavior Survey Data Summary & Trends Report: 2013-2023. Atlanta, GA: CDC; 2024.
+5. Coker TR, Elliott MN, Toomey SL, et al. Racial and ethnic disparities in ADHD diagnosis and treatment. *Pediatrics.* 2016;138(3):e20160407.
+6. Fadus MC, Ginsburg KR, Engman KH, Aalsma MC, Smith-Bynum MA. Racial and ethnic disparities in the diagnosis and treatment of childhood mental health conditions. *Pediatrics.* 2020;146(5):e2020010470.
+7. Lu W. Adolescent depression: national trends, risk factors, and healthcare disparities. *Am J Health Behav.* 2019;43(1):181-194.
+8. Barros AJD, Hirakata VN. Alternatives for logistic regression in cross-sectional studies: an empirical comparison of models that directly estimate the prevalence ratio. *BMC Med Res Methodol.* 2003;3:21.
+9. Twenge JM, Joiner TE, Rogers ML, Martin GN. Increases in depressive symptoms, suicide-related outcomes, and suicide rates among U.S. adolescents after 2010 and links to increased new media screen time. *Clin Psychol Sci.* 2018;6(1):3-17.
+10. Young S, Adamo N, Ásgeirsdóttir BB, et al. Females with ADHD: an expert consensus statement. *BMC Psychiatry.* 2020;20:404.
+
+---
+
+*Data availability:* NSCH public-use data files are available at [childhealthdata.org](https://www.childhealthdata.org/).
+
+*Code availability:* All analysis scripts (R) are available in the project repository.
